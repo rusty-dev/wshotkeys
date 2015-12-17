@@ -1,0 +1,119 @@
+#!/usr/bin/python3
+
+from argparse import ArgumentParser
+import asyncio
+import websockets
+import evdev
+from evdev.ecodes import *
+from select import select
+from functools import partial
+import os
+import json
+
+
+_CLIENTS = []
+_PRESSED = set()
+
+
+class Client(object):
+    def __init__(self, hotkey_data, websocket):
+        hotkeys = json.loads(hotkey_data)
+        self.hotkeys = {self.get_hotkey(hotkey['keys']): hotkey['message'] for hotkey in hotkeys}
+        self.peer = websocket
+
+    def get_hotkey(self, keys):
+        return frozenset(map(ecodes.get, keys))
+
+    def notify(self, pressed):
+        for keys, msg in self.hotkeys.items():
+            if pressed == keys and self.peer.open:
+                yield from self.peer.send(msg)
+
+
+@asyncio.coroutine
+def server(websocket, path):
+    print('Client connected')
+    hotkey_data = yield from websocket.recv()
+    try:
+        client = Client(hotkey_data, websocket)
+        _CLIENTS.append(client)
+    except:
+        print('Failed to parse hotkey data:', hotkey_data)
+        websocket.close()
+        return
+
+    while True:
+        if not websocket.open:
+            _CLIENTS.remove(client)
+            print('Client disconnected')
+            return
+        yield from asyncio.sleep(5)
+
+
+def process_keys(keyboard):
+    for event in keyboard.read():
+        if event.type != EV_KEY:
+            continue
+        if event.value == 1:
+            _PRESSED.add(event.code)
+        elif event.value == 0:
+            _PRESSED.discard(event.code)
+
+        for client in _CLIENTS:
+            asyncio.async(client.notify(_PRESSED))
+
+
+def detect_keyboard():
+    for dev_path in evdev.list_devices():
+        dev = evdev.InputDevice(dev_path)
+        caps = dev.capabilities()
+        if ' KB ' in dev.name and any(k == EV_LED for k in caps.keys()):
+            return dev
+            break
+    else:
+        return
+
+
+def get_keyboard(path=None):
+    if path:
+        return evdev.InputDevice(opts.keyboard)
+    else:
+        return detect_keyboard()
+
+
+def get_options(args=None):
+    p = ArgumentParser('WebSocket hot-key server.')
+    p.add_argument('-p', '--port', help='Run WebSocket server on this port.', default=46724, type=int)
+    p.add_argument(
+        '-a',
+        '--addr',
+        help='Run WebSocket server on this address. '
+             '[SECURITY RISK]: Using 0.0.0.0 will allow anyone to log your keyboard activity, '
+             'only set this if you REALLY know what you\'re doing.',
+        default='127.0.0.1'
+    )
+    p.add_argument('-k', '--keyboard', help='Path to keyboard device (auto-detected if unset).', default=None)
+    return p.parse_args(args)
+
+if __name__ == '__main__':
+    opts = get_options()
+
+    if os.getuid() != 0:
+        print('Must be run as root.')
+        exit(1)
+
+    keyboard = get_keyboard(opts.keyboard)
+    if not keyboard:
+        print('Failed to find keyboard.')
+        exit(1)
+
+    loop = asyncio.get_event_loop()
+    loop.add_reader(keyboard, partial(process_keys, keyboard))
+    start_server = websockets.serve(server, opts.addr, opts.port)
+    print('Running server at', (opts.addr, opts.port))
+    try:
+        loop.run_until_complete(start_server)
+        loop.run_forever()
+    except KeyboardInterrupt:
+        print('Stopping server...')
+        exit(0)
